@@ -1,0 +1,202 @@
+---
+title: "pre processing"
+output: html_document
+date: "2024-10-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+olink=read.csv("olink.csv")
+olink=na.omit(olink)
+```
+
+```{r}
+library("data.table")
+iLung_Cancer10=fread("DM_240321.tab", integer64 = "numeric")
+names(olink)[2]="f.eid"
+olink2=merge(olink,iLung_Cancer10,by="f.eid",all=FALSE)
+```
+
+```{r,warning=FALSE}
+library(reshape)
+library(parallel)
+iLung_Cancer10=as.data.frame(olink2[,c(1,2930:3447)])
+iLung_Cancer_10<-c("C33","C34")
+cancer<-Reduce(function(x,y)cbind(x,y),mclapply(2:260,function(i){
+aaa<-ifelse(substr(iLung_Cancer10[,i],1,3)%in%iLung_Cancer_10,1,0)
+aaa[is.na(aaa)==T]<-0
+return(aaa)
+},mc.cores=1))
+cancer<-as.data.frame(cancer)
+rownames(cancer)<-iLung_Cancer10$f.eid
+cancer$status <- rowSums(cancer[,1:259])
+cancer$status <- ifelse(cancer$status > 0,1,0)
+LC_time<-Reduce(function(x,y)cbind(x,y),mclapply(1:259,function(i){
+aaa<-ifelse(cancer[,i]==1 ,as.character(iLung_Cancer10[,i+260]),NA)
+return(aaa)
+},mc.cores=1))
+LC_time<-as.data.frame(LC_time)
+LC_time$mintime<-apply(LC_time,1,min,na.rm=T)
+LC_time$mintime<-as.Date(LC_time$mintime)#最早患病时间
+```
+
+```{r}
+olink=cbind(LC_time$mintime,olink)
+data2=fread("PAA1.tab")
+olink=merge(olink,data2[,c(1,2,6)],by="f.eid",all=FALSE)
+```
+
+```{r}
+time2=substr(olink$f.53.0.0, 1, 4)
+time2=as.numeric(time2)
+time2=substr(olink$f.53.0.0, 1, 10)
+time1=substr(olink$`LC_time$mintime`, 1, 10)
+Lung_Cancer=ifelse(as.Date(time2)>as.Date(time1),0,1)
+olink=cbind(Lung_Cancer,olink)
+```
+
+```{r}
+olink_lc=olink[-which(olink$Lung_Cancer=="0"),]
+```
+
+```{r}
+olink_lc=olink_lc[,-c(3:5,2917,2918)]
+```
+
+```{r}
+olink_lc$Lung_Cancer=ifelse(is.na(olink_lc$Lung_Cancer),0,1)
+```
+
+```{r}
+olink_lc=merge(olink_lc,olink[,c(2,3,2917)])
+olink_lc$`LC_time$mintime`=ifelse(is.na(olink_lc$`LC_time$mintime`),"2022-11-30",substr(olink_lc$`LC_time$mintime`,1,10))
+time1=substr(olink_lc$f.53.0.0,1,10)
+time2=substr(olink_lc$`LC_time$mintime`,1,10)
+time2=as.Date(time2)
+time1=as.Date(time1)
+olink_lc$time=(time2-time1)/365.25
+```
+
+```{r}
+cov=read.csv("Covariables.csv")
+olink_lc=merge(olink_lc,cov,by="f.eid")
+```
+
+```{r}
+library(readr)
+protein_ID_coding143 <- read_delim("coding143.tsv", 
+                                   delim = "\t", 
+                                   escape_double = FALSE,
+                                   trim_ws = TRUE)
+```
+
+```{r}
+protein_ID_coding143$protein <- gsub("\\;.*","", protein_ID_coding143$meaning)
+protein_ID_coding143$protein[which(protein_ID_coding143$protein == "HLA-DRA")] <- "HLA_DRA"
+protein_ID_coding143$protein[which(protein_ID_coding143$protein == "HLA-E")] <- "HLA_E"
+```
+
+```{r}
+names(olink_lc)[3:2913] <- gsub("^X", "", names(olink_lc)[3:2913])
+```
+
+```{r}
+names(olink_lc)[3:2913] <- protein_ID_coding143$protein[match(names(olink_lc)[3:2913], protein_ID_coding143$coding)]
+```
+
+```{r}
+set.seed(2024)
+n <- nrow(olink_lc)
+train_index <- sample(1:n, size = 0.7 * n)
+train=olink_lc[train_index, ]
+test=olink_lc[-train_index, ]
+```
+
+```{r}
+library(survival)
+dat=c()
+for (i in 3:2913) {
+model=coxph(Surv(time,Lung_Cancer)~train[,i]+age+sex+BMI+factor(smoking_status)+factor(IPAQ)+factor(alcohol_freq)+townsend+factor(education),data=train)
+sum=summary(model)
+x2=sum$coefficients[1,c(1,5)]
+dat=rbind(dat,x2)
+}
+```
+
+
+```{r}
+dat=as.data.frame(dat)
+bonferroni_threshold <- 0.05 / 2920
+library(dplyr)
+dat <- dat %>%
+  mutate(Significant = ifelse(`Pr(>|z|)`< bonferroni_threshold & coef > 0, "Up",
+                      ifelse(`Pr(>|z|)` < bonferroni_threshold & coef < 0, "Down", "Not Significant")))
+
+rownames(dat)=colnames(train)[3:2913]
+dat$Protein=rownames(dat)
+dat$coef=exp(dat$coef)
+```
+
+```{r,width=6,height=5}
+library(ggplot2)
+library(ggrepel)
+
+ggplot(dat, aes(x = coef, y = -log10(`Pr(>|z|)`), color = Significant)) +
+  geom_point() +
+  geom_text_repel(data = subset(dat, Significant != "Not Significant"), 
+                  aes(label = Protein), 
+                  size = 2,  
+                  box.padding = 0.5, 
+                  point.padding = 0.5,
+                  max.overlaps = Inf) +
+  scale_color_manual(values = c("Up" = "red", "Down" = "blue", "Not Significant" = "grey")) +
+  geom_hline(yintercept = -log10(bonferroni_threshold), linetype = "dashed", color = "black") +
+  labs(title = "Incident Lung Cancer",
+       x = "Effect size (HR)",
+       y = "-log10(P-value)") +
+  theme_minimal()
+```
+
+```{r}
+write.csv(dat,"cox.csv")
+```
+
+```{r}
+datt=dat[which(dat$`Pr(>|z|)`<=bonferroni_threshold),]
+selected_var=datt$Protein
+train2=train[,c("f.eid","Lung_Cancer",selected_var,"time")]
+test2=test[,c("f.eid","Lung_Cancer",selected_var,"time")]
+
+```
+
+```{r}
+train2$time=gsub('days','',train2$time)
+test2$time=gsub('days','',test2$time)
+```
+
+```{r}
+x_train=train2[,3:53]
+x_test=test2[,3:53]
+y_train=train2[,c(1,2,54)]
+y_test=test2[,c(1,2,54)]
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
